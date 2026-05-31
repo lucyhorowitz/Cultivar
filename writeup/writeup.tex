@@ -333,9 +333,7 @@ structure CertificateSNF (A : Matrix (Fin m) (Fin n) R) where
   hUUinv : U * Uinv = 1                                   := by native_decide
   hVVinv : V * Vinv = 1                                   := by native_decide
   heq    : U * A * V = D                                  := by native_decide
-  hdiv   : ∀ i j : Fin (min m n),
-              i.val + 1 = j.val →
-              diagEntry D i ∣ diagEntry D j               := by native_decide
+  hdiv   : divChainWithinRank D                           := by native_decide
 \end{lstlisting}
 
 The fields fall into three groups. The first group, \lean{U}, \lean{V}, and
@@ -354,12 +352,14 @@ for \(V\).
 The third group encodes the structural conditions on \(D\) itself.
 \lean{IsDiagonal D} says that every off-diagonal entry of \(D\) is zero
 (off-diagonal here means \(i \neq j\) as natural numbers, since \(D\) is
-rectangular). \lean{hdiv} is the divisibility chain
-\(d_1 \mid d_2 \mid \cdots\) from \Cref{def:snf}, but stated only for
-\emph{consecutive} indices --- the full chain follows from transitivity, so
-there is no need to store quadratically many divisibility witnesses. The
-indices \(i, j\) range over \(\mathtt{Fin}(\min m\, n)\) because that is the
-length of the diagonal of an \(m \times n\) matrix.
+rectangular). \lean{hdiv} packages the divisibility chain
+\(d_1 \mid d_2 \mid \cdots\) from \Cref{def:snf} through the predicate
+\lean{divChainWithinRank D}, which asserts the divisibility only for
+\emph{consecutive} indices (the full chain follows by transitivity) and
+only within the rank prefix (\(j < \mathtt{firstZeroDiag}\ D\)), since the
+trailing zeros impose no constraint. The indices \(i, j\) range over
+\(\mathtt{Fin}(\min m\, n)\) because that is the length of the diagonal
+of an \(m \times n\) matrix.
 
 The remaining piece is the rank. The number \lean{r} is defined to be
 \lean{firstZeroDiag D}, the smallest index where the diagonal of \(D\)
@@ -569,12 +569,12 @@ i.e.\ \(M\) is the bottom \(n - r\) rows of \(V^{-1} d_{k+1}\). The
 identification is then a one-line matrix computation: for any
 \(z \in \mathbb{Z}^p\), the chain \(d_{k+1} z\) is a cycle, and its image
 under the cycle-coordinate equivalence is
-\[
+\begin{align*}
     \mathtt{bottomCoordinates}\bigl(V^{-1} (d_{k+1} z)\bigr)
-      \;=\; \mathtt{bottomCoordinates}\bigl((V^{-1} d_{k+1})\, z\bigr)
-      \;=\; \bigl(\mathtt{bottomRows}\, r\,(V^{-1} d_{k+1})\bigr)\, z
-      \;=\; M z.
-\]
+      &\;=\; \mathtt{bottomCoordinates}\bigl((V^{-1} d_{k+1})\, z\bigr) \\
+      &\;=\; \bigl(\mathtt{bottomRows}\, r\,(V^{-1} d_{k+1})\bigr)\, z
+       \;=\; M z.
+\end{align*}
 So as \(z\) ranges over \(\mathbb{Z}^p\), the image of
 \(\operatorname{im} d_{k+1}\) under the cycle-coordinate equivalence traces
 out exactly \(\operatorname{im} M\). This is
@@ -665,8 +665,8 @@ elements to and from Sage. For example:
 
 \begin{lstlisting}[caption={The serialization interface for coefficient rings.},label={lst:sage-serializable}]
 class SageSerializable (R : Type*) where
-  toSageString   : R -> String
-  fromSageString : String -> Option R
+  toSageString   : R → String
+  fromSageString : String → Option R
   sageName       : String
 \end{lstlisting}
 
@@ -715,6 +715,197 @@ the trusted interface: the trusted path is through the tactics, which turn the
 Sage output into Lean-checked certificates.
 
 \section{Examples}\label{sec:examples}
+
+This section walks through three uses of the \lean{homology} pipeline,
+ordered by increasing complexity. The first two are landed and
+kernel-checked in \texttt{ChainCert.Examples}; the third is a target that
+exposes the current limits of the implementation and motivates the
+discussion in \Cref{sec:future-work}.
+
+\subsection{The Triangle: \texorpdfstring{$H_1(\Delta^2;\mathbb{Z})=0$}{H1(Triangle)=0}}
+
+The filled \(2\)-simplex \lean{triangleFFC} on three vertices is the
+smallest non-trivial finite facet complex. Its first homology vanishes
+because the unique boundary \(\partial_2(\{0,1,2\})\) generates the entire
+cycle group of the triangle. The Sage--Lean pipeline reproduces this in
+two steps.
+
+First, the \lean{homology} tactic produces a Sage-checked certificate:
+\begin{lstlisting}[caption={Triangle $H_1$ certificate.},label={lst:triangle-cert}]
+noncomputable def triangleH1Cert :
+    CertificateHomology (R := ℤ) triangleFFC 1 := by
+  homology triangleFFC, 1
+\end{lstlisting}
+
+Second, the \texttt{homologyEquivPi} bridge identifies the abstract
+homology module with a product of row-ideal quotients of the certified
+diagonal Smith form \(D\). For the triangle the presentation matrix has
+SNF \(\operatorname{diag}(1)\), so the single factor is
+\(\mathbb{Z}\,/\,\langle 1\rangle = 0\):
+
+\begin{lstlisting}[caption={The certified $H_1$ of the triangle is trivial.},label={lst:triangle-subsingleton}]
+theorem triangleH1_subsingleton :
+    Subsingleton triangleH1Cert.homologyModule
+\end{lstlisting}
+
+The proof is \texttt{native\_decide} on the diagonal entries of the
+certificate's Smith form, combined with the general fact that a row-ideal
+quotient \(\mathbb{Z}\,/\,\langle u\rangle\) is trivial whenever \(u\) is a
+unit.
+
+\subsection{The Projective Plane: \texorpdfstring{$H_1(\mathbb{R}P^2;\mathbb{Z})=\mathbb{Z}/2\mathbb{Z}$}{H1(RP2)=Z/2Z}}
+
+The real projective plane is the smallest closed surface whose integral
+homology has torsion. The minimal triangulation
+\lean{rp2FFC} on six vertices has 15 edges and 10 triangles; each edge
+appears in exactly two triangles and \(V-E+F = 6-15+10 = 1 = \chi(\mathbb{R}P^2)\).
+The certificate is built the same way as for the triangle:
+
+\begin{lstlisting}[caption={$\mathbb{R}P^2$ $H_1$ certificate (Sage-backed).},label={lst:rp2-cert}]
+noncomputable def rp2H1Cert :
+    CertificateHomology (R := ℤ) rp2FFC 1 := by
+  homology rp2FFC, 1
+\end{lstlisting}
+
+The composition \texttt{homologyEquivDiagonal} of \Cref{lst:homology-diagonal-equivalence}
+specialises to give the headline correctness statement for this example:
+
+\begin{lstlisting}[caption={$\mathbb{R}P^2$: certified homology equals the cokernel of the Sage diagonal.},label={lst:rp2-bridge}]
+theorem rp2H1_equiv_sage_diagonal_pi :
+    Nonempty (rp2H1Cert.homologyModule ≃ₗ[ℤ]
+      ∀ i : Fin (cellCount rp2FFC 1 - rp2H1Cert.quotientCert.certK.r),
+        ℤ ⧸ rowDiagIdeal (R := ℤ) rp2H1Cert.presentationCert.D i)
+\end{lstlisting}
+
+This is precisely the statement promised by the bridge of
+\Cref{sec:theorems}: the abstract homology module of the simplicial
+complex is linearly equivalent to the cokernel of the integer diagonal
+matrix returned by Sage. The remaining question is which diagonal Sage
+actually returned. Three short \texttt{native\_decide} probes pin it
+down:
+
+\begin{lstlisting}[caption={Structural facts about the certified Smith diagonal for $\mathbb{R}P^2$.},label={lst:rp2-torsion-structure}]
+theorem rp2_presentation_size :
+    cellCount rp2FFC 1 - rp2H1Cert.quotientCert.certK.r = 10
+
+theorem rp2_unique_non_unit_diagonal :
+    (Finset.univ.filter (fun i =>
+        ¬ IsUnit (rowDiagVal rp2H1Cert.presentationCert.D i))).card = 1
+
+theorem rp2_torsion_diagonal_is_two
+    (i) (hi : ¬ IsUnit (rowDiagVal rp2H1Cert.presentationCert.D i)) :
+    (rowDiagVal rp2H1Cert.presentationCert.D i).natAbs = 2
+\end{lstlisting}
+
+Together with \Cref{lst:rp2-bridge}, these three statements say: the
+certified homology of \(\mathbb{R}P^2\) in degree \(1\) is isomorphic to a
+product of ten row-ideal quotients of \(\mathbb{Z}\); nine of those
+factors are quotients by units (hence trivial); the remaining factor is a
+quotient by an integer of absolute value \(2\) (hence \(\mathbb{Z}/2\mathbb{Z}\)).
+The classical answer \(H_1(\mathbb{R}P^2;\mathbb{Z})=\mathbb{Z}/2\mathbb{Z}\)
+is thereby recovered as a corollary of the bridge plus three small
+kernel-checked computations on Sage output.
+
+\subsection{The Klein Bottle: A Current Limit}\label{sec:klein-attempt}
+
+The Klein bottle is the natural next example. The intended target is
+\(H_0(K;\mathbb{Z}) \cong \mathbb{Z}\),
+\(H_1(K;\mathbb{Z}) \cong \mathbb{Z} \oplus \mathbb{Z}/2\mathbb{Z}\), and
+\(H_2(K;\mathbb{Z}) = 0\). We have a triangulation
+\lean{kleinBottleFFC} on nine vertices with eighteen triangles ready in
+\texttt{ChainCert.Examples.Complexes}, and Sage returns the expected
+Smith data in well under a second. The certificate, however, currently
+does not close in the Lean kernel:
+\begin{lstlisting}[caption={Klein bottle: cert still has a heartbeat-bound \texttt{sorry}.},label={lst:klein-attempt}]
+set_option maxHeartbeats 4000000 in
+noncomputable def kleinBottleH1Cert :
+    CertificateHomology (R := ℤ) kleinBottleFFC 1 := by
+  homology kleinBottleFFC, 1   -- exceeds heartbeats
+\end{lstlisting}
+The bottleneck is the chain-condition obligation
+\(\partial_1 \partial_2 = 0\), which the \lean{homology} tactic discharges
+by \texttt{native\_decide} on a matrix product. On nine vertices and
+eighteen triangles this exhausts the configured heartbeat budget even at
+\texttt{maxHeartbeats 4000000}. The example is therefore parked behind a
+comment in \texttt{ChainCert.Examples.KleinBottleHomology}; the obstacle
+is implementation, not mathematics, and the remediation paths are
+discussed below.
+
+\section{Future Work}\label{sec:future-work}
+
+The bridge of \Cref{sec:theorems} and its specialisation to \(\mathbb{R}P^2\)
+in \Cref{sec:examples} together establish the main correctness statement
+of this project: the certified homology module of a finite facet complex
+is linearly equivalent to the cokernel of the integer diagonal matrix
+returned by Sage. There are nevertheless several items the present
+implementation does \emph{not} discharge, and which are useful to make
+explicit before listing them as forward work.
+
+\begin{itemize}
+\item The Klein bottle certificate does not close: the \lean{homology}
+tactic's chain-condition obligation exceeds the kernel heartbeat budget
+(see \Cref{sec:klein-attempt}).
+\item There is no Lean object bundling \(\{\partial_k\}_k\) into a
+\lean{ChainComplex (ModuleCat ℤ) ℕ}, and consequently no theorem
+connecting the certified \lean{homologyModule} to Mathlib's homology
+of a chain complex.
+\item For \(\mathbb{R}P^2\), the writeup pins down
+\(H_1\cong\mathbb{Z}/2\mathbb{Z}\) through three structural facts
+(\Cref{lst:rp2-torsion-structure}), but does not exhibit an explicit
+linear equivalence \lean{homologyModule} \(\simeq_\ell\) \lean{ZMod 2}.
+\item The \lean{homology} tactic is specialised to \(\mathbb{Z}\) through
+the \lean{SageSerializable} instance, even though the certificate types
+are generic in the coefficient ring.
+\end{itemize}
+
+The paragraphs below describe the route forward for each.
+
+\paragraph{Heartbeat-bound examples.}
+The Klein-bottle obstruction of \Cref{sec:klein-attempt} is the most
+immediate item. Two routes are open. The first is a once-and-for-all
+structural proof that \(\partial_k\partial_{k+1} = 0\) holds for any
+simplicial chain complex over \(\mathbb{Z}\); this would replace the
+per-example \texttt{native\_decide} on a matrix product with a single
+kernel-friendly lemma, and would simultaneously unlock arbitrarily large
+triangulations. The second is a smarter proof-by-reflection of matrix
+product equality that works in blocks, trading kernel time for a slightly
+more involved tactic. Either suffices for Klein bottle and related
+medium-scale surfaces.
+
+\paragraph{Bridging to \texttt{HomologicalComplex}.}
+The bridge theorems of \Cref{sec:theorems} identify the algebraic quotient
+\(\ker\partial_k / \operatorname{im}\partial_{k+1}\), expressed in matrix
+coordinates, with the cokernel of the Sage-certified diagonal Smith form.
+What they do not yet do is connect this to Mathlib's
+\lean{HomologicalComplex.homology}: there is no Lean object yet that
+bundles the family \(\{\partial_k\}_k\) of boundary matrices for a finite
+facet complex into a \lean{ChainComplex (ModuleCat ℤ) ℕ}. Producing such
+an object and proving the equivalence
+\lean{(FFC.chainComplex X).homology k} \(\simeq_{\ell}\)
+\lean{cert.homologyModule}
+would let downstream users plug ChainCert certificates into the rest of
+the categorical homological algebra in Mathlib. The main missing
+ingredient is the same \(\partial^2 = 0\) lemma identified above.
+
+\paragraph{Coefficients beyond \(\mathbb{Z}\).}
+The certificate types are generic in the coefficient ring \(R\), but the
+\lean{homology} tactic currently runs Sage's SNF over \(\mathbb{Z}\)
+through the \lean{SageSerializable} instance for integers. The
+serialization layer is already general enough to extend to \(\mathbb{Q}\)
+(which is supported) and any other ring that admits a Sage round-trip; the
+work is to wire the relevant Sage SNF backends and adjust the \lean{snf}
+tactic to dispatch on the coefficient ring.
+
+\paragraph{Explicit \(\mathrm{ZMod}\) decomposition.}
+For \(\mathbb{R}P^2\) the writeup pins down
+\(H_1\cong\mathbb{Z}/2\mathbb{Z}\) via the three structural facts of
+\Cref{lst:rp2-torsion-structure}. A general utility lemma
+\(\prod_i \mathbb{Z}/\langle a_i\rangle \simeq_\ell \prod_i
+\mathrm{ZMod}\,|a_i|\), specialising the existing
+\lean{quotientDiagonalEquivPiZMod} skeleton in
+\texttt{ChainCert/Later/SNFQuotient.lean}, would let one read off
+\(H_k(X;\mathbb{Z})\) as a concrete product of \lean{ZMod n} factors
+directly from the Sage diagonal.
 
 \section*{Acknowledgments}
 The Lean-side Sage transport layer (the persistent subprocess wrapper in \texttt{SageServer.lean}) is adapted from earlier Lean--Sage tactic infrastructure by M.~Karatarakis. The original source is attributed in the file header in the project source.
