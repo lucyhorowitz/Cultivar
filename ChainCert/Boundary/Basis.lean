@@ -15,8 +15,6 @@ boundary verifier (spec side), while keeping Sage transport concerns separate.
 - Interop side: `FiniteFacetComplex.toRawFacets` encodes facets as `Nat` lists
   for JSON exchange with Sage. -/
 
-
-
 def isFaceOf (F : FiniteFacetComplex ι) (s : Finset ι) : Prop :=
   s.Nonempty ∧ ∃ f ∈ F.facets, s ⊆ f
 
