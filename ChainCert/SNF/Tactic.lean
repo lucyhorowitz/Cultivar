@@ -4,6 +4,7 @@ import ChainCert.SNF.Rank
 import ChainCert.SageServer
 import ChainCert.SageEncode
 import ChainCert.SageDecode
+import ChainCert.MatrixReflect
 import Lean.Elab.Tactic
 import Lean
 
@@ -151,55 +152,11 @@ private def decodeSerializableRowsExpr
   let rows ← ChainCert.SageDecode.decodeStringMatrix j
   rows.mapM fun row => row.mapM (parseSerializableElemExpr R)
 
-private def decodeSerializableSparseEntriesExpr
-    (R : Expr) (j : Lean.Json) : TacticM (List (Nat × Nat × Expr)) := do
-  let rows ← ChainCert.SageDecode.decodeStringMatrix j
-  let rec goRow (i j : Nat) (row : List String) (acc : List (Nat × Nat × Expr)) :
-      TacticM (List (Nat × Nat × Expr)) := do
-    match row with
-    | [] => pure acc
-    | s :: row =>
-        let acc ←
-          if s = "0" then
-            pure acc
-          else
-            pure ((i, j, ← parseSerializableElemExpr R s) :: acc)
-        goRow i (j + 1) row acc
-  let rec goRows (i : Nat) (rows : List (List String)) (acc : List (Nat × Nat × Expr)) :
-      TacticM (List (Nat × Nat × Expr)) := do
-    match rows with
-    | [] => pure acc
-    | row :: rows =>
-        let acc ← goRow i 0 row acc
-        goRows (i + 1) rows acc
-  goRows 0 rows []
-
 private def mkListExpr (α : Expr) (xs : List Expr) : TacticM Expr := do
   let nilExpr ← mkAppOptM ``List.nil #[some α]
   xs.foldrM
     (fun x acc => mkAppOptM ``List.cons #[some α, some x, some acc])
     nilExpr
-
-private def mkSparseEntryExpr (R : Expr) (entry : Nat × Nat × Expr) : TacticM Expr := do
-  let natTy := mkConst ``Nat
-  let natProdR ← mkAppM ``Prod #[natTy, R]
-  let colVal ← mkAppOptM ``Prod.mk #[
-    some natTy, some R, some (mkNatLit entry.2.1), some entry.2.2]
-  mkAppOptM ``Prod.mk #[
-    some natTy, some natProdR, some (mkNatLit entry.1), some colVal]
-
-/-- Build `rowsToMatrix rows mExpr nExpr : Matrix (Fin mExpr) (Fin nExpr) R`.
-`mExpr`/`nExpr` are arbitrary Nat-valued Exprs (not necessarily literals). -/
-private def sparseEntriesToMatrixExpr
-    (R : Expr) (entries : List (Nat × Nat × Expr)) (mExpr nExpr : Expr) : TacticM Expr := do
-  let natTy := mkConst ``Nat
-  let natProdR ← mkAppM ``Prod #[natTy, R]
-  let entryTy ← mkAppM ``Prod #[natTy, natProdR]
-  let entryExprs ← entries.mapM (mkSparseEntryExpr R)
-  let entriesExpr ← mkListExpr entryTy entryExprs
-  let zeroTy ← mkAppM ``Zero #[R]
-  let _zeroInst ← synthInstance zeroTy
-  mkAppM ``ChainCert.SageDecode.sparseRowsToMatrix #[entriesExpr, mExpr, nExpr]
 
 /-- Build `Matrix finM finN R` as an Expr, reusing existing `Fin _` Exprs directly. -/
 private def matrixTyExprFromFin (R finM finN : Expr) : MetaM Expr :=
@@ -294,20 +251,34 @@ def mkSNFCertExprFromPayload (AExpr : Expr) (payload : SnfSageJsonPayload) :
     TacticM Expr := do
   let (finM, finN, mExpr, nExpr, R) ← ensureSnfInput AExpr
   let ⟨uJson, uinvJson, dJson, vJson, vinvJson⟩ := payload
-  let uEntriesExpr ← decodeSerializableSparseEntriesExpr R uJson
-  let uinvEntriesExpr ← decodeSerializableSparseEntriesExpr R uinvJson
-  let dEntriesExpr ← decodeSerializableSparseEntriesExpr R dJson
-  let vEntriesExpr ← decodeSerializableSparseEntriesExpr R vJson
-  let vinvEntriesExpr ← decodeSerializableSparseEntriesExpr R vinvJson
+  let uEntriesExpr ←  decodeSerializableRowsExpr R uJson
+  let uinvEntriesExpr ←  decodeSerializableRowsExpr R uinvJson
+  let dEntriesExpr ←  decodeSerializableRowsExpr R dJson
+  let vEntriesExpr ←  decodeSerializableRowsExpr R vJson
+  let vinvEntriesExpr ←  decodeSerializableRowsExpr R vinvJson
 
-  let UExpr ← sparseEntriesToMatrixExpr R uEntriesExpr mExpr mExpr
-  let UinvExpr ← sparseEntriesToMatrixExpr R uinvEntriesExpr mExpr mExpr
-  let DExpr ← sparseEntriesToMatrixExpr R dEntriesExpr mExpr nExpr
-  let VExpr ← sparseEntriesToMatrixExpr R vEntriesExpr nExpr nExpr
-  let VinvExpr ← sparseEntriesToMatrixExpr R vinvEntriesExpr nExpr nExpr
+  let intTy := mkConst ``Int
+  let listIntTy ← mkAppM ``List #[intTy]          -- Expr for `List Int`
 
-  let matMMTy ← matrixTyExprFromFin R finM finM
-  let matNNTy ← matrixTyExprFromFin R finN finN
+  let URowExprs ← uEntriesExpr.mapM (fun row => mkListExpr intTy row)
+  let URowsExpr ← mkListExpr listIntTy URowExprs
+  let UExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[URowsExpr, mExpr, mExpr]
+
+  let UinvRowExprs ← uinvEntriesExpr.mapM (fun row => mkListExpr intTy row)
+  let UinvRowsExpr ← mkListExpr listIntTy UinvRowExprs
+  let UinvExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[UinvRowsExpr, mExpr, mExpr]
+
+  let DRowExprs ← dEntriesExpr.mapM (fun row => mkListExpr intTy row)
+  let DRowsExpr ← mkListExpr listIntTy DRowExprs
+  let DExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[DRowsExpr, mExpr, nExpr]
+
+  let VRowExprs ← vEntriesExpr.mapM (fun row => mkListExpr intTy row)
+  let VRowsExpr ← mkListExpr listIntTy VRowExprs
+  let VExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[VRowsExpr, nExpr, nExpr]
+
+  let VinvRowExprs ← vinvEntriesExpr.mapM (fun row => mkListExpr intTy row)
+  let VinvRowsExpr ← mkListExpr listIntTy VinvRowExprs
+  let VinvExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[VinvRowsExpr, nExpr, nExpr]
 
   let rExpr ← mkAppM ``firstZeroDiag #[DExpr]
 
@@ -315,15 +286,17 @@ def mkSNFCertExprFromPayload (AExpr : Expr) (payload : SnfSageJsonPayload) :
   let hdiagExpr ← mkHdiagProofExpr DExpr hVerify
   let hrankExpr ← mkRankProofExpr mExpr nExpr DExpr hVerify
 
-  let UUinvExpr ← mkMulExpr UExpr UinvExpr
-  let oneMM ← mkOneOfType matMMTy
-  let hUUinvTy ← mkEq UUinvExpr oneMM
-  let hUUinvExpr ← mkDecideProofExpr hUUinvTy
+  let trueExpr := toExpr true
 
-  let VVinvExpr ← mkMulExpr VExpr VinvExpr
-  let oneNN ← mkOneOfType matNNTy
-  let hVVinvTy ← mkEq VVinvExpr oneNN
-  let hVVinvExpr ← mkDecideProofExpr hVVinvTy
+  let UbExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[URowsExpr, UinvRowsExpr, mExpr, mExpr] -- the Expr for (mulIsOne U U⁻¹ m n) : Bool
+  let UbTrue ← mkEq UbExpr trueExpr -- the equality of bExpr (which should eval to true) and the trueExpr
+  let hUb ← mkDecideProofExpr UbTrue -- the decide proof of UbTrue
+  let hUUinvExpr ← mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hUb] -- the proof that U * U^⁻¹ = 1
+
+  let VbExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[VRowsExpr, VinvRowsExpr, nExpr, nExpr] -- the Expr for (mulIsOne V V⁻¹ n n) : Bool
+  let VbTrue ← mkEq VbExpr trueExpr -- the equality of VbExpr (which should eval to true) and the trueExpr
+  let hVb ← mkDecideProofExpr VbTrue -- the decide proof of VbTrue
+  let hVVinvExpr ← mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hVb] -- the proof that V * V⁻¹ = 1
 
   let UAExpr ← mkMulExpr UExpr AExpr
   let UAVExpr ← mkMulExpr UAExpr VExpr
@@ -366,16 +339,22 @@ def declareSNFCertFromPayload (baseName : Name) (AExpr : Expr)
     runTacticAsTerm `snf do
       let (finM, finN, mExpr, nExpr, R) ← ensureSnfInput AExpr
       let ⟨uJson, uinvJson, dJson, vJson, vinvJson⟩ := payload
-      let uEntriesExpr ← decodeSerializableSparseEntriesExpr R uJson
-      let uinvEntriesExpr ← decodeSerializableSparseEntriesExpr R uinvJson
-      let dEntriesExpr ← decodeSerializableSparseEntriesExpr R dJson
-      let vEntriesExpr ← decodeSerializableSparseEntriesExpr R vJson
-      let vinvEntriesExpr ← decodeSerializableSparseEntriesExpr R vinvJson
-      let UExpr ← sparseEntriesToMatrixExpr R uEntriesExpr mExpr mExpr
-      let UinvExpr ← sparseEntriesToMatrixExpr R uinvEntriesExpr mExpr mExpr
-      let DExpr ← sparseEntriesToMatrixExpr R dEntriesExpr mExpr nExpr
-      let VExpr ← sparseEntriesToMatrixExpr R vEntriesExpr nExpr nExpr
-      let VinvExpr ← sparseEntriesToMatrixExpr R vinvEntriesExpr nExpr nExpr
+      let uEntriesExpr ←  decodeSerializableRowsExpr R uJson
+      let uinvEntriesExpr ←  decodeSerializableRowsExpr R uinvJson
+      let dEntriesExpr ←  decodeSerializableRowsExpr R dJson
+      let vEntriesExpr ←  decodeSerializableRowsExpr R vJson
+      let vinvEntriesExpr ←  decodeSerializableRowsExpr R vinvJson
+      let intTy := mkConst ``Int
+      let listIntTy ← mkAppM ``List #[intTy]
+      let toMatrix (entries : List (List Expr)) (rowsDim colsDim : Expr) : TacticM Expr := do
+        let rowExprs ← entries.mapM (fun row => mkListExpr intTy row)
+        let rowsExpr ← mkListExpr listIntTy rowExprs
+        mkAppM ``ChainCert.SageDecode.rowsToMatrix #[rowsExpr, rowsDim, colsDim]
+      let UExpr ← toMatrix uEntriesExpr mExpr mExpr
+      let UinvExpr ← toMatrix uinvEntriesExpr mExpr mExpr
+      let DExpr ← toMatrix dEntriesExpr mExpr nExpr
+      let VExpr ← toMatrix vEntriesExpr nExpr nExpr
+      let VinvExpr ← toMatrix vinvEntriesExpr nExpr nExpr
       pure (finM, finN, mExpr, nExpr, R, UExpr, UinvExpr, DExpr, VExpr, VinvExpr)
 
   let matMMTy ← matrixTyExprFromFin R finM finM
