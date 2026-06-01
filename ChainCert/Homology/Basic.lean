@@ -7,6 +7,7 @@ import ChainCert.SimplicialComplex
 import ChainCert.Boundary.Basis
 import ChainCert.SNF.Core
 import ChainCert.SageEncode
+import ChainCert.Boundary.ChainCondition
 
 variable {α : Type*} {m n p : ℕ}
 variable {R : Type*} [CommRing R] [IsDomain R] [IsPrincipalIdealRing R]
@@ -200,5 +201,13 @@ def presentation_has_snf {X : FFC ι} {k : ℕ}
     (cert : CertificateHomology (R := R) X k) :
     CertificateSNF (A := cert.presentationMatrix) :=
   cert.presentationCert
+
+
+omit [CommRing R] [IsDomain R] [IsPrincipalIdealRing R] [DecidableEq R] [SageSerializable R] in
+theorem boundaryK_comp_eq_zero_int (X : FFC ι) (k : ℕ) :
+    boundaryK (R := ℤ) X k * boundaryK (R := ℤ) X (k + 1) = 0 := by
+  cases k with
+  | zero => simp [boundaryK]
+  | succ n => simpa [boundaryK] using boundaryMatrix_comp_eq_zero X n
 
 end CertificateHomology

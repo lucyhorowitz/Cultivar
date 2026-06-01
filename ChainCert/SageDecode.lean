@@ -70,20 +70,6 @@ def rowsToMatrix {R : Type} [Zero R] (rows : List (List R)) (m n : Nat) :
     Matrix (Fin m) (Fin n) R :=
   fun i j => (rows.getD i.val [] |>.getD j.val 0)
 
-/-- Lookup an entry in a sparse row-major matrix encoding. -/
-def lookupSparseMatrix {R : Type} [Zero R] :
-    List (Nat × Nat × R) → Nat → Nat → R
-  | [], _, _ => 0
-  | (r, c, x) :: entries, i, j =>
-      if r = i ∧ c = j then x else lookupSparseMatrix entries i j
-
-/-- Build a matrix from sparse `(row, column, value)` entries, returning zero
-for entries not present in the sparse list. -/
-def sparseRowsToMatrix {R : Type} [Zero R]
-    (entries : List (Nat × Nat × R)) (m n : Nat) :
-    Matrix (Fin m) (Fin n) R :=
-  fun i j => lookupSparseMatrix entries i.val j.val
-
 /-- Build an expression for `rowsToMatrix rows m n` from an expression
 `rows : List (List R)` and type expression `R`. -/
 def matrixExprOfRows

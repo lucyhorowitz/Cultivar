@@ -4,6 +4,7 @@ import ChainCert.SNF.Rank
 import ChainCert.SageServer
 import ChainCert.SageEncode
 import ChainCert.SageDecode
+import ChainCert.MatrixReflect
 import Lean.Elab.Tactic
 import Lean
 
@@ -53,6 +54,22 @@ the matrices in Lean, and builds a `CertificateSNF A` term checked by Lean.
 
 open Lean Elab Tactic Meta Expr
 
+register_option chainCert.profile : Bool := {
+  defValue := false
+  descr := "print timing information for ChainCert elaborator/tactic stages"
+}
+
+def ChainCert.profileStep (label : String) (x : TacticM α) : TacticM α := do
+  if chainCert.profile.get (← getOptions) then
+    logInfo m!"[chainCert.profile] start {label}"
+    let start ← IO.monoMsNow
+    let a ← x
+    let elapsed := (← IO.monoMsNow) - start
+    logInfo m!"[chainCert.profile] done  {label}: {elapsed}ms"
+    pure a
+  else
+    x
+
 structure SnfSageJsonPayload where
   U : Lean.Json
   Uinv : Lean.Json
@@ -100,13 +117,17 @@ private def addCertToContext
 /-- Call Sage for SNF. Serializes `A` via `matStringList` → `evalMatStringListSafe`
 (compiled-code path; does not require `Fin` dims to reduce in the kernel). -/
 private def callSnfSageJson (AExpr : Expr) : TacticM SnfSageJsonPayload := do
-  let rows ← evalMatStringListSafe AExpr
+  let rows ← ChainCert.profileStep "snf: evaluate input matrix" <| evalMatStringListSafe AExpr
   let matStr := stringListToMatString rows
-  let reqJson := Lean.Json.mkObj [
-    ("op", Lean.Json.str "snf"),
-    ("matrix", Lean.Json.str matStr)
-  ]
-  let json ← sendSageRequest reqJson
+  if chainCert.profile.get (← getOptions) then
+    let cols := rows.head?.map (·.length) |>.getD 0
+    logInfo m!"[chainCert.profile] snf: input matrix {rows.length} x {cols}"
+  let json ← ChainCert.profileStep "snf: Sage request" <| do
+    let reqJson := Lean.Json.mkObj [
+      ("op", Lean.Json.str "snf"),
+      ("matrix", Lean.Json.str matStr)
+    ]
+    sendSageRequest reqJson
   let U ← IO.ofExcept (json.getObjVal? "U")
   let Uinv ← IO.ofExcept (json.getObjVal? "Uinv")
   let D ← IO.ofExcept (json.getObjVal? "D")
@@ -151,28 +172,18 @@ private def decodeSerializableRowsExpr
   let rows ← ChainCert.SageDecode.decodeStringMatrix j
   rows.mapM fun row => row.mapM (parseSerializableElemExpr R)
 
-private def decodeSerializableSparseEntriesExpr
-    (R : Expr) (j : Lean.Json) : TacticM (List (Nat × Nat × Expr)) := do
-  let rows ← ChainCert.SageDecode.decodeStringMatrix j
-  let rec goRow (i j : Nat) (row : List String) (acc : List (Nat × Nat × Expr)) :
-      TacticM (List (Nat × Nat × Expr)) := do
-    match row with
-    | [] => pure acc
-    | s :: row =>
-        let acc ←
-          if s = "0" then
-            pure acc
-          else
-            pure ((i, j, ← parseSerializableElemExpr R s) :: acc)
-        goRow i (j + 1) row acc
-  let rec goRows (i : Nat) (rows : List (List String)) (acc : List (Nat × Nat × Expr)) :
-      TacticM (List (Nat × Nat × Expr)) := do
-    match rows with
-    | [] => pure acc
-    | row :: rows =>
-        let acc ← goRow i 0 row acc
-        goRows (i + 1) rows acc
-  goRows 0 rows []
+private def decodeIntRowsFromStrings (rows : List (List String)) : TacticM (List (List Int)) :=
+  rows.mapM fun row =>
+    row.mapM fun s =>
+      match s.toInt? with
+      | some z => pure z
+      | none => throwError "snf: failed to decode Sage entry `{s}` as ring `ZZ`"
+
+private def mulRows (A B : List (List Int)) (m n p : Nat) : List (List Int) :=
+  (List.range m).map fun i =>
+    (List.range p).map fun j =>
+      ((List.range n).map fun k =>
+        (A.getD i []).getD k 0 * (B.getD k []).getD j 0).sum
 
 private def mkListExpr (α : Expr) (xs : List Expr) : TacticM Expr := do
   let nilExpr ← mkAppOptM ``List.nil #[some α]
@@ -180,26 +191,13 @@ private def mkListExpr (α : Expr) (xs : List Expr) : TacticM Expr := do
     (fun x acc => mkAppOptM ``List.cons #[some α, some x, some acc])
     nilExpr
 
-private def mkSparseEntryExpr (R : Expr) (entry : Nat × Nat × Expr) : TacticM Expr := do
-  let natTy := mkConst ``Nat
-  let natProdR ← mkAppM ``Prod #[natTy, R]
-  let colVal ← mkAppOptM ``Prod.mk #[
-    some natTy, some R, some (mkNatLit entry.2.1), some entry.2.2]
-  mkAppOptM ``Prod.mk #[
-    some natTy, some natProdR, some (mkNatLit entry.1), some colVal]
-
-/-- Build `rowsToMatrix rows mExpr nExpr : Matrix (Fin mExpr) (Fin nExpr) R`.
-`mExpr`/`nExpr` are arbitrary Nat-valued Exprs (not necessarily literals). -/
-private def sparseEntriesToMatrixExpr
-    (R : Expr) (entries : List (Nat × Nat × Expr)) (mExpr nExpr : Expr) : TacticM Expr := do
-  let natTy := mkConst ``Nat
-  let natProdR ← mkAppM ``Prod #[natTy, R]
-  let entryTy ← mkAppM ``Prod #[natTy, natProdR]
-  let entryExprs ← entries.mapM (mkSparseEntryExpr R)
-  let entriesExpr ← mkListExpr entryTy entryExprs
-  let zeroTy ← mkAppM ``Zero #[R]
-  let _zeroInst ← synthInstance zeroTy
-  mkAppM ``ChainCert.SageDecode.sparseRowsToMatrix #[entriesExpr, mExpr, nExpr]
+def ChainCert.intRowsToExpr (rows : List (List Int)) : TacticM Expr := do
+  let intTy := mkConst ``Int
+  let listIntTy ← mkAppM ``List #[intTy]
+  let rowExprs ← rows.mapM fun row => do
+    let entries := row.map mkIntLit
+    mkListExpr intTy entries
+  mkListExpr listIntTy rowExprs
 
 /-- Build `Matrix finM finN R` as an Expr, reusing existing `Fin _` Exprs directly. -/
 private def matrixTyExprFromFin (R finM finN : Expr) : MetaM Expr :=
@@ -292,47 +290,103 @@ private def mkDivisibilityProofType (mExpr nExpr DExpr : Expr) : TacticM Expr :=
 JSON, then elaborate and type-check it. -/
 def mkSNFCertExprFromPayload (AExpr : Expr) (payload : SnfSageJsonPayload) :
     TacticM Expr := do
-  let (finM, finN, mExpr, nExpr, R) ← ensureSnfInput AExpr
+  let (_finM, _finN, mExpr, nExpr, R) ←
+    ChainCert.profileStep "snf cert: inspect input type" <| ensureSnfInput AExpr
   let ⟨uJson, uinvJson, dJson, vJson, vinvJson⟩ := payload
-  let uEntriesExpr ← decodeSerializableSparseEntriesExpr R uJson
-  let uinvEntriesExpr ← decodeSerializableSparseEntriesExpr R uinvJson
-  let dEntriesExpr ← decodeSerializableSparseEntriesExpr R dJson
-  let vEntriesExpr ← decodeSerializableSparseEntriesExpr R vJson
-  let vinvEntriesExpr ← decodeSerializableSparseEntriesExpr R vinvJson
+  let (uEntriesExpr, uinvEntriesExpr, dEntriesExpr, vEntriesExpr, vinvEntriesExpr) ←
+    ChainCert.profileStep "snf cert: decode payload matrices" <| do
+      let uEntriesExpr ← decodeSerializableRowsExpr R uJson
+      let uinvEntriesExpr ← decodeSerializableRowsExpr R uinvJson
+      let dEntriesExpr ← decodeSerializableRowsExpr R dJson
+      let vEntriesExpr ← decodeSerializableRowsExpr R vJson
+      let vinvEntriesExpr ← decodeSerializableRowsExpr R vinvJson
+      pure (uEntriesExpr, uinvEntriesExpr, dEntriesExpr, vEntriesExpr, vinvEntriesExpr)
 
-  let UExpr ← sparseEntriesToMatrixExpr R uEntriesExpr mExpr mExpr
-  let UinvExpr ← sparseEntriesToMatrixExpr R uinvEntriesExpr mExpr mExpr
-  let DExpr ← sparseEntriesToMatrixExpr R dEntriesExpr mExpr nExpr
-  let VExpr ← sparseEntriesToMatrixExpr R vEntriesExpr nExpr nExpr
-  let VinvExpr ← sparseEntriesToMatrixExpr R vinvEntriesExpr nExpr nExpr
+  let intTy := mkConst ``Int
+  let listIntTy ← mkAppM ``List #[intTy]          -- Expr for `List Int`
 
-  let matMMTy ← matrixTyExprFromFin R finM finM
-  let matNNTy ← matrixTyExprFromFin R finN finN
+  let (URowsExpr, UExpr, UinvRowsExpr, UinvExpr, DRowsExpr, DExpr,
+      VRowsExpr, VExpr, VinvRowsExpr, VinvExpr) ←
+    ChainCert.profileStep "snf cert: build witness matrix expressions" <| do
+      let URowExprs ← uEntriesExpr.mapM (fun row => mkListExpr intTy row)
+      let URowsExpr ← mkListExpr listIntTy URowExprs
+      let UExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[URowsExpr, mExpr, mExpr]
+      let UinvRowExprs ← uinvEntriesExpr.mapM (fun row => mkListExpr intTy row)
+      let UinvRowsExpr ← mkListExpr listIntTy UinvRowExprs
+      let UinvExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[UinvRowsExpr, mExpr, mExpr]
+      let DRowExprs ← dEntriesExpr.mapM (fun row => mkListExpr intTy row)
+      let DRowsExpr ← mkListExpr listIntTy DRowExprs
+      let DExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[DRowsExpr, mExpr, nExpr]
+      let VRowExprs ← vEntriesExpr.mapM (fun row => mkListExpr intTy row)
+      let VRowsExpr ← mkListExpr listIntTy VRowExprs
+      let VExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[VRowsExpr, nExpr, nExpr]
+      let VinvRowExprs ← vinvEntriesExpr.mapM (fun row => mkListExpr intTy row)
+      let VinvRowsExpr ← mkListExpr listIntTy VinvRowExprs
+      let VinvExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[VinvRowsExpr, nExpr, nExpr]
+      pure (URowsExpr, UExpr, UinvRowsExpr, UinvExpr, DRowsExpr, DExpr,
+        VRowsExpr, VExpr, VinvRowsExpr, VinvExpr)
+
+  let (ARowsExpr, UARowsExpr) ← ChainCert.profileStep "snf cert: build reflected row data" <| do
+    let mVal ← evalNatSafe mExpr
+    let nVal ← evalNatSafe nExpr
+    let uRows ← ChainCert.SageDecode.decodeIntMatrix uJson
+    let aRows ← decodeIntRowsFromStrings (← evalMatStringListSafe AExpr)
+    let uaRows := mulRows uRows aRows mVal mVal nVal
+    let ARowsExpr ← ChainCert.intRowsToExpr aRows
+    let UARowsExpr ← ChainCert.intRowsToExpr uaRows
+    pure (ARowsExpr, UARowsExpr)
 
   let rExpr ← mkAppM ``firstZeroDiag #[DExpr]
 
-  let hVerify ← mkVerifyDiagProofExpr DExpr
-  let hdiagExpr ← mkHdiagProofExpr DExpr hVerify
-  let hrankExpr ← mkRankProofExpr mExpr nExpr DExpr hVerify
+  let hVerify ← ChainCert.profileStep "snf cert: prove verifyDiag" <|
+    mkVerifyDiagProofExpr DExpr
+  let hdiagExpr ← ChainCert.profileStep "snf cert: build hdiag" <|
+    mkHdiagProofExpr DExpr hVerify
+  let hrankExpr ← ChainCert.profileStep "snf cert: build hrank" <|
+    mkRankProofExpr mExpr nExpr DExpr hVerify
 
-  let UUinvExpr ← mkMulExpr UExpr UinvExpr
-  let oneMM ← mkOneOfType matMMTy
-  let hUUinvTy ← mkEq UUinvExpr oneMM
-  let hUUinvExpr ← mkDecideProofExpr hUUinvTy
+  let trueExpr := toExpr true
 
-  let VVinvExpr ← mkMulExpr VExpr VinvExpr
-  let oneNN ← mkOneOfType matNNTy
-  let hVVinvTy ← mkEq VVinvExpr oneNN
-  let hVVinvExpr ← mkDecideProofExpr hVVinvTy
+  let hUUinvExpr ← ChainCert.profileStep "snf cert: prove U inverse" <| do
+    let UbExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[
+      URowsExpr, UinvRowsExpr, mExpr, mExpr]
+    let UbTrue ← mkEq UbExpr trueExpr
+    let hUb ← mkDecideProofExpr UbTrue
+    mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hUb]
 
-  let UAExpr ← mkMulExpr UExpr AExpr
-  let UAVExpr ← mkMulExpr UAExpr VExpr
-  let heqTy ← mkEq UAVExpr DExpr
-  let heqExpr ← mkDecideProofExpr heqTy
+  let hVVinvExpr ← ChainCert.profileStep "snf cert: prove V inverse" <| do
+    let VbExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[
+      VRowsExpr, VinvRowsExpr, nExpr, nExpr]
+    let VbTrue ← mkEq VbExpr trueExpr
+    let hVb ← mkDecideProofExpr VbTrue
+    mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hVb]
 
-  let hdivExpr ← mkHdivProofExpr DExpr hVerify
+  let (_heqTy, heqExpr) ← ChainCert.profileStep "snf cert: prove U*A*V = D" <| do
+    let UAExpr ← mkMulExpr UExpr AExpr
+    let UAVExpr ← mkMulExpr UAExpr VExpr
+    let heqTy ← mkEq UAVExpr DExpr
+    let AMatrixExpr ← mkAppM ``ChainCert.SageDecode.rowsToMatrix #[ARowsExpr, mExpr, nExpr]
+    let hATy ← mkEq AExpr AMatrixExpr
+    let hAExpr ← mkDecideProofExpr hATy
+    let UAbExpr ← mkAppM ``ChainCert.Reflect.mulEqB
+      #[URowsExpr, ARowsExpr, UARowsExpr, mExpr, mExpr, nExpr]
+    let UAbTrue ← mkEq UAbExpr trueExpr
+    let hUAb ← mkDecideProofExpr UAbTrue
+    let UAVbExpr ← mkAppM ``ChainCert.Reflect.mulEqB
+      #[UARowsExpr, VRowsExpr, DRowsExpr, mExpr, nExpr, nExpr]
+    let UAVbTrue ← mkEq UAVbExpr trueExpr
+    let hUAVb ← mkDecideProofExpr UAVbTrue
+    let heqExpr ← mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_matrix_mul_eq_of_mulEqB
+      #[hAExpr, hUAb, hUAVb]
+    unless (← isDefEq (← inferType heqExpr) heqTy) do
+      throwError "snf: internal error constructing reflected triple-product proof"
+    pure (heqTy, heqExpr)
 
-  let certExpr ← mkAppOptM ``CertificateSNF.mk #[
+  let hdivExpr ← ChainCert.profileStep "snf cert: build hdiv" <|
+    mkHdivProofExpr DExpr hVerify
+
+  let certExpr ← ChainCert.profileStep "snf cert: assemble certificate" <|
+    mkAppOptM ``CertificateSNF.mk #[
     some mExpr, some nExpr,
     some R,
     none, none,
@@ -366,21 +420,47 @@ def declareSNFCertFromPayload (baseName : Name) (AExpr : Expr)
     runTacticAsTerm `snf do
       let (finM, finN, mExpr, nExpr, R) ← ensureSnfInput AExpr
       let ⟨uJson, uinvJson, dJson, vJson, vinvJson⟩ := payload
-      let uEntriesExpr ← decodeSerializableSparseEntriesExpr R uJson
-      let uinvEntriesExpr ← decodeSerializableSparseEntriesExpr R uinvJson
-      let dEntriesExpr ← decodeSerializableSparseEntriesExpr R dJson
-      let vEntriesExpr ← decodeSerializableSparseEntriesExpr R vJson
-      let vinvEntriesExpr ← decodeSerializableSparseEntriesExpr R vinvJson
-      let UExpr ← sparseEntriesToMatrixExpr R uEntriesExpr mExpr mExpr
-      let UinvExpr ← sparseEntriesToMatrixExpr R uinvEntriesExpr mExpr mExpr
-      let DExpr ← sparseEntriesToMatrixExpr R dEntriesExpr mExpr nExpr
-      let VExpr ← sparseEntriesToMatrixExpr R vEntriesExpr nExpr nExpr
-      let VinvExpr ← sparseEntriesToMatrixExpr R vinvEntriesExpr nExpr nExpr
+      let uEntriesExpr ←  decodeSerializableRowsExpr R uJson
+      let uinvEntriesExpr ←  decodeSerializableRowsExpr R uinvJson
+      let dEntriesExpr ←  decodeSerializableRowsExpr R dJson
+      let vEntriesExpr ←  decodeSerializableRowsExpr R vJson
+      let vinvEntriesExpr ←  decodeSerializableRowsExpr R vinvJson
+      let intTy := mkConst ``Int
+      let listIntTy ← mkAppM ``List #[intTy]
+      let toMatrix (entries : List (List Expr)) (rowsDim colsDim : Expr) : TacticM Expr := do
+        let rowExprs ← entries.mapM (fun row => mkListExpr intTy row)
+        let rowsExpr ← mkListExpr listIntTy rowExprs
+        mkAppM ``ChainCert.SageDecode.rowsToMatrix #[rowsExpr, rowsDim, colsDim]
+      let UExpr ← toMatrix uEntriesExpr mExpr mExpr
+      let UinvExpr ← toMatrix uinvEntriesExpr mExpr mExpr
+      let DExpr ← toMatrix dEntriesExpr mExpr nExpr
+      let VExpr ← toMatrix vEntriesExpr nExpr nExpr
+      let VinvExpr ← toMatrix vinvEntriesExpr nExpr nExpr
       pure (finM, finN, mExpr, nExpr, R, UExpr, UinvExpr, DExpr, VExpr, VinvExpr)
 
   let matMMTy ← matrixTyExprFromFin R finM finM
   let matMNTy ← matrixTyExprFromFin R finM finN
   let matNNTy ← matrixTyExprFromFin R finN finN
+
+  let ⟨uJson, uinvJson, dJson, vJson, vinvJson⟩ := payload
+  let mVal ← runTacticAsTerm `snf (evalNatSafe mExpr)
+  let nVal ← runTacticAsTerm `snf (evalNatSafe nExpr)
+  let uRows ← ChainCert.SageDecode.decodeIntMatrix uJson
+  let uinvRows ← ChainCert.SageDecode.decodeIntMatrix uinvJson
+  let dRows ← ChainCert.SageDecode.decodeIntMatrix dJson
+  let vRows ← ChainCert.SageDecode.decodeIntMatrix vJson
+  let vinvRows ← ChainCert.SageDecode.decodeIntMatrix vinvJson
+  let aRows ← runTacticAsTerm `snf do
+    decodeIntRowsFromStrings (← evalMatStringListSafe AExpr)
+  let uaRows := mulRows uRows aRows mVal mVal nVal
+  let URowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr uRows)
+  let UinvRowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr uinvRows)
+  let DRowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr dRows)
+  let VRowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr vRows)
+  let VinvRowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr vinvRows)
+  let ARowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr aRows)
+  let UARowsExpr ← runTacticAsTerm `snf (ChainCert.intRowsToExpr uaRows)
+  let trueExpr := toExpr true
 
   let UName := baseName.str "U"
   logInfo m!"snf decl: adding {UName}"
@@ -440,7 +520,13 @@ def declareSNFCertFromPayload (baseName : Name) (AExpr : Expr)
     let UUinvExpr ← mkMulExpr UConst UinvConst
     let oneMM ← mkOneOfType matMMTy
     let hUUinvTy ← mkEq UUinvExpr oneMM
-    let hUUinvExpr ← mkDecideProofExpr hUUinvTy
+    let bExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[
+      URowsExpr, UinvRowsExpr, mExpr, mExpr]
+    let bTrue ← mkEq bExpr trueExpr
+    let hb ← mkDecideProofExpr bTrue
+    let hUUinvExpr ← mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hb]
+    unless (← isDefEq (← inferType hUUinvExpr) hUUinvTy) do
+      throwError "snf decl: internal error constructing reflected U inverse proof"
     pure (hUUinvTy, hUUinvExpr)
   addRegularDefDecl hUUinvName hUUinvTy hUUinvExpr
   let hUUinvConst := mkConst hUUinvName
@@ -451,7 +537,13 @@ def declareSNFCertFromPayload (baseName : Name) (AExpr : Expr)
     let VVinvExpr ← mkMulExpr VConst VinvConst
     let oneNN ← mkOneOfType matNNTy
     let hVVinvTy ← mkEq VVinvExpr oneNN
-    let hVVinvExpr ← mkDecideProofExpr hVVinvTy
+    let bExpr ← mkAppM ``ChainCert.Reflect.mulIsOneB #[
+      VRowsExpr, VinvRowsExpr, nExpr, nExpr]
+    let bTrue ← mkEq bExpr trueExpr
+    let hb ← mkDecideProofExpr bTrue
+    let hVVinvExpr ← mkAppM ``ChainCert.Reflect.rowsToMatrix_mul_eq_one #[hb]
+    unless (← isDefEq (← inferType hVVinvExpr) hVVinvTy) do
+      throwError "snf decl: internal error constructing reflected V inverse proof"
     pure (hVVinvTy, hVVinvExpr)
   addRegularDefDecl hVVinvName hVVinvTy hVVinvExpr
   let hVVinvConst := mkConst hVVinvName
@@ -462,7 +554,23 @@ def declareSNFCertFromPayload (baseName : Name) (AExpr : Expr)
     let UAExpr ← mkMulExpr UConst AExpr
     let UAVExpr ← mkMulExpr UAExpr VConst
     let heqTy ← mkEq UAVExpr DConst
-    let heqExpr ← mkDecideProofExpr heqTy
+    let AMatrixExpr ←
+      mkAppM ``ChainCert.SageDecode.rowsToMatrix #[ARowsExpr, mExpr, nExpr]
+    let hATy ← mkEq AExpr AMatrixExpr
+    let hAExpr ← mkDecideProofExpr hATy
+    let UAbExpr ← mkAppM ``ChainCert.Reflect.mulEqB
+      #[URowsExpr, ARowsExpr, UARowsExpr, mExpr, mExpr, nExpr]
+    let UAbTrue ← mkEq UAbExpr trueExpr
+    let hUAb ← mkDecideProofExpr UAbTrue
+    let UAVbExpr ← mkAppM ``ChainCert.Reflect.mulEqB
+      #[UARowsExpr, VRowsExpr, DRowsExpr, mExpr, nExpr, nExpr]
+    let UAVbTrue ← mkEq UAVbExpr trueExpr
+    let hUAVb ← mkDecideProofExpr UAVbTrue
+    let heqExpr ← mkAppM
+      ``ChainCert.Reflect.rowsToMatrix_mul_matrix_mul_eq_of_mulEqB
+        #[hAExpr, hUAb, hUAVb]
+    unless (← isDefEq (← inferType heqExpr) heqTy) do
+      throwError "snf decl: internal error constructing reflected triple-product proof"
     pure (heqTy, heqExpr)
   addRegularDefDecl heqName heqTy heqExpr
   let heqConst := mkConst heqName
@@ -539,7 +647,10 @@ syntax (name := snfTac) "snf " term (" as " ident)? : tactic
   let certExprTy ← inferType certExpr
   let certTy ← certTypeFor AExpr
   unless (← isDefEq certExprTy certTy) do
-    throwError "snf: internal error, certificate term has wrong type\nactual: {certExprTy}\nexpected: {certTy}"
+    throwError
+      "snf: internal error, certificate term has wrong type\n\
+      actual: {certExprTy}\n\
+      expected: {certTy}"
 
   let goal' ← addCertToContext goal certName AExpr certExpr
   -- logInfo "snf: added `cert : CertificateSNF A` to local context."
