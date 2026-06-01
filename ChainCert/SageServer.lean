@@ -19,11 +19,18 @@ def getSageServer : IO (IO.Process.Child {stdin := .piped, stdout := .piped, std
   | none =>
     -- This ensures we find sage_server.py in your current directory
     let serverScript := "scripts/snf_server.py"
+    let dotSage ← match (← IO.getEnv "DOT_SAGE") with
+      | some path => pure path
+      | none =>
+          let path := System.mkFilePath ["/tmp", "chaincert-sage-cache"]
+          IO.FS.createDirAll path
+          pure path.toString
     let child ← IO.Process.spawn {
       -- Use the absolute path to the Conda sage binary
       cmd := "sage",
       args := #["-python", serverScript],
-      stdin := .piped, stdout := .piped, stderr := .piped
+      stdin := .piped, stdout := .piped, stderr := .piped,
+      env := #[("DOT_SAGE", some dotSage)]
     }
     sageServerRef.set (some child)
     return child
@@ -38,6 +45,11 @@ def sendSageRequest (req : Lean.Json) : MetaM Lean.Json := do
   server.stdin.putStr (req.compress ++ "\n")
   server.stdin.flush
   let respStr ← server.stdout.getLine
+  if respStr.isEmpty then
+    let _ ← server.wait
+    let stderr ← server.stderr.readToEnd
+    sageServerRef.set none
+    throwError s!"Sage server produced no JSON response. Stderr:\n{stderr}"
   match Lean.Json.parse respStr with
   | .error err =>
     throwError s!"Sage JSON parse error: {err}\nRaw response: {respStr}"

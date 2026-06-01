@@ -1,4 +1,5 @@
 import ChainCert.Homology.Tactic
+import ChainCert.Homology.Bridge
 import ChainCert.Examples.Complexes
 
 /-!
@@ -18,23 +19,10 @@ example : True := by
   have _ :
       CertificateHomology (R := ℤ) triangleFFC 1 := hTri
   have _ :
-      ChainQuotientCert
-        (boundaryK (R := ℤ) triangleFFC 1)
-        (boundaryK (R := ℤ) triangleFFC 2) := hTri.quotientCert
+      hTri.homologyModule ≃ₗ[ℤ] hTri.certifiedHomologyGroup := hTri.correct
   have _ :
-      CertificateSNF (A := hTri.presentationMatrix) := hTri.presentationCert
-  have _ :
-      boundaryK (R := ℤ) triangleFFC 1 *
-          boundaryK (R := ℤ) triangleFFC 2 = 0 :=
-    hTri.boundary_comp_next
-  have _ :
-      hTri.presentationMatrix =
-        cyclePresentationMatrix hTri.quotientCert.certK
-          (boundaryK (R := ℤ) triangleFFC 2) :=
-    hTri.presentationMatrix_eq
-  have _ :
-      CertificateSNF (A := hTri.presentationMatrix) :=
-    hTri.presentation_has_snf
+      Nonempty (hTri.homologyModule ≃ₗ[ℤ] hTri.certifiedHomologyGroup) :=
+    hTri.homology_is_certified_group
   trivial
 
 /-- `homology X, k` closes a matching `CertificateHomology` goal. -/
