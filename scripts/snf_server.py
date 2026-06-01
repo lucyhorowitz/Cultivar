@@ -12,8 +12,8 @@
 #   "homology" -> {"facets": [[...]], "dim"?:k, "base_ring"?:"ZZ"|"QQ"|"GF(p)",
 #                  "reduced"?:bool, "witnesses"?:bool}
 #                                             returns invariants per dim (or one dim);
-#                                             if witnesses=true, also returns snf_k and
-#                                             snf_M for the chosen dim — the minimal
+#                                             if witnesses=true, also returns M, snf_k,
+#                                             and snf_M for the chosen dim — the minimal
 #                                             certificate Lean needs to verify H_k(X).
 #                                             Requires base_ring="ZZ" and "dim".
 
@@ -185,6 +185,7 @@ def handle_homology(req):
             "Vinv": mat_to_rows(Vk_inv),
             "D": mat_to_rows(Dk),
         }
+        result["M"] = mat_to_rows(M)
         result["snf_M"] = _snf_witness_block(M)
 
     return result

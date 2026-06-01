@@ -8,4 +8,5 @@ import ChainCert.Boundary.Tactic
 import ChainCert.Homology.Basic
 import ChainCert.Homology.Bridge
 import ChainCert.Homology.Command
+import ChainCert.Homology.MatrixReflect
 import ChainCert.Homology.Tactic

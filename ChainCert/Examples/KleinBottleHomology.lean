@@ -24,11 +24,12 @@ Target result:
 
 -- #homology kleinBottleFFC, 1
 
--- /-- Build the H₁ certificate via the `homology` tactic (term-mode), avoiding
--- `homology_cert`'s slow per-field `addAbbrevDecl`. -/
--- set_option maxHeartbeats 4000000 in
--- noncomputable def kleinBottleH1Cert : CertificateHomology (R := ℤ) kleinBottleFFC 1 := by
---   homology kleinBottleFFC, 1
+-- Klein's 19 × 18 homology presentation SNF certificate exceeds the default budget.
+set_option maxHeartbeats 4000000 in
+/-- Build the H₁ certificate via the `homology` tactic (term-mode), avoiding
+`homology_cert`'s slow per-field `addAbbrevDecl`. -/
+noncomputable def kleinBottleH1Cert : CertificateHomology (R := ℤ) kleinBottleFFC 1 := by
+  homology kleinBottleFFC, 1
 
 example : True := by
   homology triangleFFC, 1
